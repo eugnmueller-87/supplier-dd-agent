@@ -3,56 +3,41 @@ from datetime import datetime, timedelta
 import httpx
 from agent.state import DDState
 
-NEWSAPI_URL = "https://newsapi.org/v2/everything"
+NEWSAPI_URL = "https://newsapi.ai/api/v1/article/getArticles"
 
-NEGATIVE_KEYWORDS = [
-    # English
-    "fraud", "lawsuit", "fined", "penalty", "bribery", "corruption", "bankrupt",
-    "insolvency", "breach", "violation", "recall", "investigation", "scandal",
-    "money laundering", "sanction", "forced labour", "child labour", "arrest",
-    # German
-    "Betrug", "Klage", "Bußgeld", "Strafe", "Bestechung", "Korruption",
-    "Insolvenz", "Verstoß", "Ermittlung", "Rückruf", "Skandal",
-    "Geldwäsche", "Sanktion", "Zwangsarbeit", "Kinderarbeit", "Verhaftung",
-]
-
-SEVERITY_HIGH = {
+# Hard negative keywords — high severity regardless of sentiment score
+HIGH_SEVERITY_KEYWORDS = [
     "sanction", "forced labour", "child labour", "money laundering", "bribery",
     "Sanktion", "Zwangsarbeit", "Kinderarbeit", "Geldwäsche", "Bestechung",
-}
+    "fraud", "corruption", "arrest", "indictment",
+    "Betrug", "Korruption", "Verhaftung", "Anklage",
+]
 
 
-def _flag_negative(text: str) -> bool:
-    text_lower = text.lower()
-    return any(kw.lower() in text_lower for kw in NEGATIVE_KEYWORDS)
-
-
-def _flag_severity(text: str) -> str:
-    text_lower = text.lower()
-    if any(kw.lower() in text_lower for kw in SEVERITY_HIGH):
+def _flag_severity(title: str, body: str, sentiment: float | None) -> str:
+    combined = (title + " " + body).lower()
+    if any(kw.lower() in combined for kw in HIGH_SEVERITY_KEYWORDS):
         return "high"
-    if _flag_negative(text):
+    # newsapi.ai sentiment: negative < 0, neutral ~0, positive > 0
+    if sentiment is not None and sentiment < -0.1:
         return "medium"
     return "none"
 
 
-def _fetch_newsapi(query: str, days: int = 90, page_size: int = 10) -> list[dict]:
-    api_key = os.environ["NEWSAPI_KEY"]
+def _fetch(query: str, days: int = 90, count: int = 10) -> list[dict]:
     from_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
-    r = httpx.get(
-        NEWSAPI_URL,
-        params={
-            "q": query,
-            "from": from_date,
-            "sortBy": "relevancy",
-            "pageSize": page_size,
-            "apiKey": api_key,
-            "language": "en",
-        },
-        timeout=15,
-    )
+    body = {
+        "action": "getArticles",
+        "keyword": query,
+        "dateStart": from_date,
+        "articlesCount": count,
+        "articlesSortBy": "rel",
+        "resultType": "articles",
+        "apiKey": os.environ["NEWSAPI_KEY"],
+    }
+    r = httpx.post(NEWSAPI_URL, json=body, timeout=15)
     r.raise_for_status()
-    return r.json().get("articles", [])
+    return r.json().get("articles", {}).get("results", [])
 
 
 def news_sentiment(state: DDState) -> dict:
@@ -60,7 +45,6 @@ def news_sentiment(state: DDState) -> dict:
     hermes_tracked = state.get("hermes_tracked", False)
     hermes_signal_count = state.get("hermes_intel", {}).get("signal_count", 0)
 
-    # Skip NewsAPI if Hermes already has strong coverage (>10 signals)
     if hermes_tracked and hermes_signal_count > 10:
         return {
             "news_results": {
@@ -77,26 +61,25 @@ def news_sentiment(state: DDState) -> dict:
     articles = []
     errors = []
 
-    # EN query — general risk signals
     queries = [
-        f'"{company}" risk OR fraud OR lawsuit OR sanction OR investigation',
-        f'"{company}" supply chain OR supplier OR procurement',
+        f"{company} risk fraud lawsuit sanction investigation",
+        f"{company} supply chain human rights Lieferkette",
     ]
 
     for query in queries:
         try:
-            raw = _fetch_newsapi(query, page_size=5)
+            raw = _fetch(query, count=8)
             for a in raw:
                 title = a.get("title", "") or ""
-                description = a.get("description", "") or ""
-                combined = f"{title} {description}"
-                severity = _flag_severity(combined)
+                body = a.get("body", "") or ""
+                sentiment_score = a.get("sentiment")
+                severity = _flag_severity(title, body[:500], sentiment_score)
                 articles.append({
                     "title": title,
-                    "source": a.get("source", {}).get("name", ""),
+                    "source": (a.get("source") or {}).get("title", ""),
                     "url": a.get("url", ""),
-                    "published_at": a.get("publishedAt", "")[:10],
-                    "description": description[:300],
+                    "published_at": (a.get("dateTime") or "")[:10],
+                    "sentiment_score": round(sentiment_score, 3) if sentiment_score is not None else None,
                     "negative_flag": severity != "none",
                     "severity": severity,
                 })
@@ -104,15 +87,15 @@ def news_sentiment(state: DDState) -> dict:
             errors.append(str(e))
 
     # Deduplicate by URL
-    seen = set()
-    unique_articles = []
+    seen: set[str] = set()
+    unique = []
     for a in articles:
         if a["url"] not in seen:
             seen.add(a["url"])
-            unique_articles.append(a)
+            unique.append(a)
 
-    negative_count = sum(1 for a in unique_articles if a["negative_flag"])
-    high_severity_count = sum(1 for a in unique_articles if a["severity"] == "high")
+    negative_count = sum(1 for a in unique if a["negative_flag"])
+    high_severity_count = sum(1 for a in unique if a["severity"] == "high")
 
     if high_severity_count > 0:
         sentiment = "negative_high"
@@ -127,11 +110,11 @@ def news_sentiment(state: DDState) -> dict:
         "news_results": {
             "company": company,
             "skipped": False,
-            "total_articles": len(unique_articles),
+            "total_articles": len(unique),
             "negative_count": negative_count,
             "high_severity_count": high_severity_count,
             "sentiment": sentiment,
-            "articles": unique_articles,
+            "articles": unique,
             "errors": errors,
         }
     }
